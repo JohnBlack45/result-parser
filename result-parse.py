@@ -4,7 +4,6 @@ from datetime import time
 import pathlib
 import os
 import hashlib
-from operator import itemgetter
 
 HTML_HEADER = \
 """<!DOCTYPE html>
@@ -50,13 +49,29 @@ HEADER_STRINGS = {
 
 WHEELCHAIR_ATHLETES = ["jim corbett", "paul hannan", "karol doherty", "james divin"]
 
-class ExcelDateFormatException(Exception):
-    pass
+RESULT_DIRECTORY = "output/"
+UNSUPPORTED_FILE_TYPES = [".pdf", ".doc", ".docx"]
+
 
 def strip_excessive_spaces(input_string):
     input_string = input_string.lstrip().rstrip()
     input_string = " ".join(input_string.split())
     return input_string
+
+
+def sha256sum(filename):
+    h = hashlib.sha256()
+    b = bytearray(128*1024)
+    mv = memoryview(b)
+    with open(filename, 'rb', buffering=0) as f:
+        for n in iter(lambda : f.readinto(mv), 0):
+            h.update(mv[:n])
+    return h.hexdigest()
+
+
+class ExcelDateFormatException(Exception):
+    pass
+
 
 class Runner():
     def __init__(self, name):
@@ -95,33 +110,22 @@ class Sheet:
 
     def __init__(self, parent, index):
         self.parent = parent
-        self.workbook = parent.workbook
-        self.handle = self.workbook.sheet_by_index(index)
+        self.handle = self.parent.workbook.sheet_by_index(index)
         self.index = index
         self.html_table = ""
         self.is_empty = self.is_empty_sheet()
+        self.heading_row_found = False
         self.heading_row = -1
         self.winner = ""
         self.columns = {}
 
-        global info
-
         if not self.is_empty:
-            self.heading_row = self.find_heading_row()
+            self.find_heading_row()
+            if self.heading_row_found:
+                self.winner = Runner(self.get_winner())
 
-            if self.heading_row != -1:
-                info.headings_found += 1
-                self.identify_columns()
-
-                runner = Runner(self.get_winner())
-                self.winner = runner
-                if runner.get_key() in info.winners.keys():
-                    info.winners[runner.get_key()].wins += 1
-                else:
-                    runner.wins = 1
-                    info.winners[runner.get_key()] = runner
-            else:
-                info.headings_not_found += 1
+    def bootstrap_html_table(self):
+        self.html_table = self.html_table.replace("<table>", "<table class=\"table table-striped table-hover table-sm\">")
 
     def build_html_table(self):
 
@@ -152,10 +156,10 @@ class Sheet:
                 # Date = 3
                 elif cell.ctype == 3:
                     try:
-                        time_raw = xldate_as_tuple(cell.value, self.workbook.datemode)
+                        time_raw = xldate_as_tuple(cell.value, self.parent.workbook.datemode)
                         value = str(time(*time_raw[3:]))
                     except Exception as e:
-                        info.date_format_issue += 1
+                        #info.date_format_issue += 1
                         raise ExcelDateFormatException
 
                 row_list.append(value)
@@ -199,17 +203,18 @@ class Sheet:
             heading_matches_in_row = 0
 
             for col in range(0, self.handle.ncols):
-                cell_string = str(self.handle.cell(row, col).value).lower().replace(" ", "")
+                cell_value = self.get_cell_value(row, col)
 
                 for heading in HEADER_STRINGS.values():
                     for pattern in heading:
 
-                        if pattern == cell_string:
+                        if pattern == cell_value:
                             heading_matches_in_row += 1
 
                             if heading_matches_in_row > 2:
-                                return row
-        return -1
+                                self.heading_row_found = True
+                                self.heading_row = row
+                                self.identify_columns()
 
     def is_row_empty(self, row, count=0):
 
@@ -224,11 +229,14 @@ class Sheet:
                     value_found += 1
         return True
 
+    def get_cell_value(self, row, col):
+        return str(self.handle.cell(row, col).value).lower().replace(" ", "")
+
     def identify_columns(self):
 
         for col in range(0, self.handle.ncols):
 
-            cell_value = str(self.handle.cell(self.heading_row, col).value).lower().replace(" ", "")
+            cell_value = self.get_cell_value(self.heading_row, col)
 
             for heading in HEADER_STRINGS.keys():
                 match_strings = HEADER_STRINGS.get(heading)
@@ -281,12 +289,7 @@ class Sheet:
         winner = winner.replace("o'", "O")
         winner = winner.replace("Mc ", "Mc")
         winner = winner.replace("mc ", "Mc")
-
         return winner
-
-
-    def bootstrap_html_table(self):
-        self.html_table = self.html_table.replace("<table>", "<table class=\"table table-striped table-hover table-sm\">")
 
 
 class ExcelFile:
@@ -294,77 +297,115 @@ class ExcelFile:
     def __init__(self, path):
         self.path = path
         self.html = ""
-        self.heading_row = ""
         self.sheets = []
         self.workbook = open_workbook(path)
+        self.empty_sheets_count = 0
+
+        # Only add non empty sheets
+        for sheet_index in range(0, self.workbook.nsheets):
+            sheet = Sheet(self, sheet_index)
+            if sheet.is_empty:
+                self.empty_sheets_count += 1
+                continue
+            else:
+                self.sheets.append(sheet)
 
     def build_html(self):
 
-        global info
-
         self.html = HTML_HEADER + CSS_SCRIPT
 
-        for sheet_index in range(0, self.workbook.nsheets):
-
-            info.num_sheets += 1
-
-            sheet = Sheet(self, sheet_index)
-            if sheet.is_empty:
-                info.empty_sheets += 1
-                continue
+        for sheet in self.sheets:
 
             # Add a blank line between every sheet
-            if sheet_index != 0:
-                self.html += "<br>"
+            self.html += "<br>"
 
-            #print(f"{self.path} {sheet.winner}")
-
-            #try:
-            #    self.html += sheet.build_html_table()
-            #except ExcelDateFormatException:
-            #    return ""
+            try:
+                self.html += sheet.build_html_table()
+            except ExcelDateFormatException:
+                return ""
 
         self.html += HTML_FOOTER
 
-
-def sha256sum(filename):
-    h = hashlib.sha256()
-    b = bytearray(128*1024)
-    mv = memoryview(b)
-    with open(filename, 'rb', buffering=0) as f:
-        for n in iter(lambda : f.readinto(mv), 0):
-            h.update(mv[:n])
-    return h.hexdigest()
-
-
-RESULT_DIRECTORY = "output/"
-UNSUPPORTED_FILE_TYPES = [".pdf", ".doc", ".docx"]
+    def get_winners(self):
+        winners = []
+        for sheet in self.sheets:
+            winners.append(sheet.winner)
+        return winners
 
 
 class Info:
 
     def __init__(self):
-        self.num_files = 0
-        self.unsupported_files = []
-        self.supported_file = []
+        self.files_count = 0
+
         self.file_hashes = set()
         self.headings_found = 0
         self.headings_not_found = 0
-        self.num_sheets = 0
-        self.empty_sheets = 0
+        self.sheets_count = 0
+        self.empty_sheets_count = 0
         self.date_format_issue = 0
-        self.duplicate_files_found = 0
-        self.exception_files = 0
+
+        self.supported_files_count = 0
+        self.supported_files = []
+
+        self.unsupported_files_count = 0
+        self.unsupported_files = []
+
+        self.duplicate_files_count = 0
+        self.duplicate_files = []
+
+        self.exception_files_count = 0
+        self.exception_files = []
         self.winners = {}
 
+    def add_winners(self, winners):
+
+        for runner in winners:
+
+            if runner is "":
+                continue
+
+            if runner.get_key() in self.winners.keys():
+                self.winners[runner.get_key()].wins += 1
+            else:
+                runner.wins = 1
+                self.winners[runner.get_key()] = runner
+
+    def update_stats(self):
+
+        self.files_count = len(self.unsupported_files) + len(self.supported_files)
+        self.supported_files_count = len(self.supported_files)
+        self.unsupported_files_count = len(self.unsupported_files)
+        self.exception_files_count = len(self.exception_files)
+        self.duplicate_files_count = len(self.duplicate_files)
+
+        for file in self.supported_files:
+            self.sheets_count += len(file.sheets)
+            self.empty_sheets_count += file.empty_sheets_count
+            self.add_winners(file.get_winners())
+
+    def generate_winner_table(self):
+        unsorted_list = info.winners.values()
+        sorted_list = sorted(unsorted_list, key=lambda runner: runner.wins)
+        sorted_list.reverse()
+
+        table_list = []
+        for runner in sorted_list:
+            table_list.append(runner.convert_to_list())
+
+        table = tabulate(table_list, tablefmt="plain")
+        return table
+
     def __repr__(self):
-        table = [["# Files", self.num_files],
-                ["Supported", len(self.supported_file)],
-                ["Unsupported", len(self.unsupported_files)],
-                ["Duplicates", self.duplicate_files_found],
-                ["Exceptions", self.exception_files],
-                ["# Sheets", self.num_sheets],
-                ["Empty", self.empty_sheets],
+        self.update_stats()
+
+        table = [["# Files", self.files_count],
+                ["Supported", self.supported_files_count],
+                ["Unsupported", self.unsupported_files_count],
+                ["Duplicates", self.duplicate_files_count],
+                ["Exceptions", self.exception_files_count],
+                ["# Sheets", self.sheets_count],
+                ["Empty", self.empty_sheets_count],
                 ["Date Issues", self.date_format_issue],
                 ["Heading", self.headings_found],
                 ["No Heading", self.headings_not_found]]
@@ -373,49 +414,31 @@ class Info:
         return output
 
 
-info = Info()
+if __name__ == "__main__":
 
-for file in os.listdir(RESULT_DIRECTORY):
+    info = Info()
 
-    info.num_files += 1
+    for file in os.listdir(RESULT_DIRECTORY):
 
-    path = RESULT_DIRECTORY + file
+        path = RESULT_DIRECTORY + file
+        file_type = pathlib.Path(path).suffix
 
-    file_type = pathlib.Path(path).suffix
+        if file_type in UNSUPPORTED_FILE_TYPES:
+            info.unsupported_files.append(file)
+            continue
 
-    if file_type in UNSUPPORTED_FILE_TYPES:
-        info.unsupported_files.append(file)
-        continue
+        file_hash = sha256sum(path)
+        if file_hash in info.file_hashes:
+            info.duplicate_files.append(path)
+            continue
+        info.file_hashes.add(file_hash)
 
-    file_hash = sha256sum(path)
-    if file_hash in info.file_hashes:
-        info.duplicate_files_found += 1
-        continue
-    info.file_hashes.add(file_hash)
+        try:
+            file = ExcelFile(path)
+            info.supported_files.append(file)
+        except Exception as e:
+            info.exception_files.append(path)
+            continue
 
-    try:
-        file = ExcelFile(path)
-    except Exception as e:
-        info.exception_files += 1
-        continue
-
-    file.build_html()
-    info.supported_file.append(file)
-
-print(info)
-
-unsorted_list = info.winners.values()
-sorted_list = sorted(unsorted_list, key=lambda runner: runner.wins)
-sorted_list.reverse()
-
-table_list = []
-for runner in sorted_list:
-    table_list.append(runner.convert_to_list())
-
-table = tabulate(table_list, tablefmt="plain")
-print(table)
-
-#remove double spaces, remove wheelchair guy jim corbet
-
-
-# add the names as key with first name and surname in alphabetical order that way there should be no duplicates...
+    print(info)
+    print(info.generate_winner_table())
